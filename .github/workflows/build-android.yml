@@ -1,0 +1,128 @@
+name: Build PAGES Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ARM64 · Pocket TTS 18.2M
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout PAGES build workspace
+        uses: actions/checkout@v4
+
+      - name: Reassemble and verify the native PAGES source archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat sourcearchive/PAGES-*.b64 | tr -d '\r\n ' | base64 --decode > PAGES-native-source.tar.xz
+          echo "28e32eb2fe9da5db4ac16457a37b2c5b4f1d81a178e537862c22e7fa4547c59e  PAGES-native-source.tar.xz" | sha256sum --check
+          xz --test PAGES-native-source.tar.xz
+          tar -xJf PAGES-native-source.tar.xz
+
+      - name: Install native build prerequisites
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake ninja-build pkg-config
+
+      - name: Bundle PDF.js for fully offline PDF import
+        run: |
+          mkdir -p android/app/src/main/assets/pages/vendor
+          curl --location --fail --retry 5 https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs -o android/app/src/main/assets/pages/vendor/pdf.min.mjs
+          curl --location --fail --retry 5 https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs -o android/app/src/main/assets/pages/vendor/pdf.worker.min.mjs
+          test -s android/app/src/main/assets/pages/vendor/pdf.min.mjs
+          test -s android/app/src/main/assets/pages/vendor/pdf.worker.min.mjs
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build tools and NDK
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Set up Rust for Android ARM64
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: aarch64-linux-android
+          toolchain: stable
+
+      - name: Configure Android cross-compilation
+        shell: bash
+        run: |
+          NDK="$ANDROID_HOME/ndk/27.2.12479018"
+          HOST_TAG=linux-x86_64
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/$HOST_TAG/bin"
+          echo "CMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake" >> "$GITHUB_ENV"
+          echo "ANDROID_ABI=arm64-v8a" >> "$GITHUB_ENV"
+          echo "ANDROID_PLATFORM=android-26" >> "$GITHUB_ENV"
+          echo "CMAKE_ANDROID_ARCH_ABI=arm64-v8a" >> "$GITHUB_ENV"
+          echo "CMAKE_SYSTEM_VERSION=26" >> "$GITHUB_ENV"
+          echo "CC_aarch64_linux_android=$TOOLCHAIN/aarch64-linux-android26-clang" >> "$GITHUB_ENV"
+          echo "CXX_aarch64_linux_android=$TOOLCHAIN/aarch64-linux-android26-clang++" >> "$GITHUB_ENV"
+          echo "AR_aarch64_linux_android=$TOOLCHAIN/llvm-ar" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/aarch64-linux-android26-clang" >> "$GITHUB_ENV"
+          echo "CMAKE_GENERATOR=Ninja" >> "$GITHUB_ENV"
+          echo "CMAKE_BUILD_PARALLEL_LEVEL=2" >> "$GITHUB_ENV"
+
+      - name: Fetch upstream Kyutai runtime source
+        run: |
+          git clone --depth 1 https://github.com/kyutai-labs/pocket-tts.git vendor/pocket-tts
+          echo "Kyutai source revision: $(git -C vendor/pocket-tts rev-parse HEAD)"
+
+      - name: Download and verify the official 18.2M model and four speaker states
+        run: bash scripts/fetch_pocket_18m.sh
+
+      - name: Build Pocket TTS 18.2M native ARM64 library
+        run: |
+          cargo build --manifest-path native-engine/Cargo.toml --release --target aarch64-linux-android
+          mkdir -p android/app/src/main/jniLibs/arm64-v8a
+          cp native-engine/target/aarch64-linux-android/release/libpages_tts.so android/app/src/main/jniLibs/arm64-v8a/libpages_tts.so
+          file android/app/src/main/jniLibs/arm64-v8a/libpages_tts.so
+
+      - name: Build PAGES APK
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Assemble Android APK
+        working-directory: android
+        run: gradle --no-daemon --stacktrace :app:assembleDebug
+
+      - name: Verify APK contains ARM64 Pocket TTS runtime
+        run: |
+          APK=android/app/build/outputs/apk/debug/app-debug.apk
+          test -s "$APK"
+          unzip -l "$APK" | grep -E 'lib/arm64-v8a/libpages_tts.so|assets/pocket_tts/model.safetensors|assets/pocket_tts/tokenizer.model|assets/pocket_tts/voices/alba.safetensors'
+          sha256sum "$APK"
+
+      - name: Upload installable APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PAGES-0.2.0-ARM64-PocketTTS-18M
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish APK release
+        if: success() && github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: pages-v0.2.0-${{ github.run_number }}
+          name: PAGES 0.2.0 · Pocket TTS 18.2M
+          body: |
+            PAGES Android ARM64 build with the real Kyutai `english_18m_2026-10` model, offline model weights, tokenizer and four bundled speaker states (Alba, Anna, Charles, Michael).
+
+            This is a debug-signed installable APK for direct device testing. It is not signed with a Play Store release key.
+          files: android/app/build/outputs/apk/debug/app-debug.apk
+          fail_on_unmatched_files: true
